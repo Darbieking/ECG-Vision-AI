@@ -4,3 +4,4 @@ torch
 torchvision
 openai
 pillow
+ipython
