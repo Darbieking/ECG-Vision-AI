@@ -1,43 +1,47 @@
 import streamlit as st
+import pathlib
+import platform
+import os
+
+# --- 1. THE CRITICAL FIX ---
+# We must apply this patch BEFORE importing fastai.
+# This forces Linux to accept 'WindowsPath' objects from your model file.
+posix_backup = pathlib.PosixPath
+try:
+    pathlib.WindowsPath = pathlib.PosixPath
+except:
+    pass
+
+# --- 2. IMPORTS ---
+# Now it is safe to import fastai
 from fastai.vision.all import *
 from PIL import Image
 import json
-from openai import OpenAI
-import pathlib
 
-# --- 1. CONFIGURATION ---
+# --- 3. CONFIGURATION ---
 st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
 
-# --- 2. MODEL LOADING (Robust) ---
+# --- 4. MODEL LOADING ---
 @st.cache_resource
 def load_ecg_model():
-    """Loads the FastAI model. Cached for speed."""
+    model_path = 'ecg_model_v1.pkl'
     
-    # Check if file exists first
-    if not os.path.exists('ecg_model_v1.pkl'):
-        st.error("❌ Model file 'ecg_model_v1.pkl' not found! Please upload it to your GitHub repo.")
+    if not os.path.exists(model_path):
+        st.error(f"❌ Critical Error: Model file '{model_path}' not found!")
         st.stop()
-    
+
     try:
-        # Try loading normally (Linux -> Linux)
-        learn = load_learner('ecg_model_v1.pkl')
+        # Load the model
+        learn = load_learner(model_path)
         return learn
     except Exception as e:
-        # Fallback: If there's a path issue (Windows -> Linux), try patching
-        try:
-            temp = pathlib.PosixPath
-            pathlib.PosixPath = pathlib.WindowsPath
-            learn = load_learner('ecg_model_v1.pkl')
-            return learn
-        except Exception as e2:
-            st.error(f"❌ CRITICAL ERROR Loading Model: {e}")
-            st.error(f"Fallback attempt also failed: {e2}")
-            st.stop()
+        st.error(f"❌ Error loading model: {e}")
+        st.stop()
 
-# Load immediately. If this fails, the app stops here.
+# Load immediately
 learn = load_ecg_model()
 
-# --- 3. UI LAYOUT ---
+# --- 5. UI LAYOUT ---
 st.title("🫀 AI-Powered ECG Interpreter")
 st.markdown("Upload a 12-lead ECG image (or rhythm strip) for instant analysis.")
 
@@ -51,15 +55,12 @@ with col1:
         image = Image.open(uploaded_file)
         st.image(image, caption="Uploaded ECG", use_column_width=True)
         
-        # PREDICTION BUTTON
         if st.button("Analyze Tracing"):
             with st.spinner("Analyzing rhythm patterns..."):
                 try:
-                    # FastAI Inference
                     pred_class, pred_idx, probs = learn.predict(image)
                     confidence = float(probs[pred_idx]) * 100
                     
-                    # Store results in session state to persist
                     st.session_state.prediction = pred_class
                     st.session_state.confidence = confidence
                     st.session_state.run_llm = True
@@ -70,11 +71,9 @@ with col2:
     st.header("Clinical Report")
     
     if 'prediction' in st.session_state:
-        # 1. DISPLAY VISION RESULTS
         pred = st.session_state.prediction
         conf = st.session_state.confidence
         
-        # Color code based on severity
         color = "red" if pred in ["Inferior MI", "Anterior MI", "AFib"] else "green"
         
         st.markdown(f"### Diagnosis: <span style='color:{color}'>{pred.upper()}</span>", unsafe_allow_html=True)
@@ -84,29 +83,28 @@ with col2:
         if conf < 70:
             st.warning("⚠️ Low confidence. Clinical correlation required.")
 
-        # 2. GENERATE LLM REPORT
+        # LLM SECTION
         if st.session_state.get('run_llm', False):
-            
-            # CHECK FOR API KEY (Secrets or Sidebar)
-            api_key = st.secrets.get("OPENAI_API_KEY", None)
+            # Check for API Key in Secrets OR Environment Variable
+            api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
             
             if not api_key:
-                st.warning("⚠️ No OpenAI API Key found in Secrets. Using Mock Report.")
+                st.warning("⚠️ No OpenAI API Key found. Using Mock Report.")
                 report = {
                     "rhythm_diagnosis": pred,
-                    "clinical_significance": "Requires API Key for full analysis.",
-                    "key_findings": ["Pattern matched visual features"],
-                    "immediate_action": "Configure Secrets on Streamlit Cloud.",
+                    "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
+                    "key_findings": ["Visual pattern matches diagnosis", "QRS morphology consistent"],
+                    "immediate_action": "Verify with cardiologist.",
                     "urgency": "High"
                 }
             else:
                 try:
+                    from openai import OpenAI
                     client = OpenAI(api_key=api_key)
                     prompt = f"""
                     You are a cardiologist. Analyze this diagnosis: {pred} (Confidence: {conf:.1f}%).
                     Return valid JSON with fields: rhythm_diagnosis, clinical_significance, key_findings (list), immediate_action, urgency.
                     """
-                    
                     response = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
@@ -117,16 +115,10 @@ with col2:
                     st.error(f"LLM Error: {e}")
                     report = None
 
-            # 3. RENDER REPORT
             if report:
                 st.subheader("📋 Physician's Note")
                 st.info(f"**Significance:** {report.get('clinical_significance')}")
-                
                 st.write("**Key Findings:**")
                 for item in report.get('key_findings', []):
                     st.write(f"- {item}")
-                
                 st.error(f"**Action:** {report.get('immediate_action')}")
-                st.caption(f"Urgency Level: {report.get('urgency')}")
-                
-            st.session_state.run_llm = False
