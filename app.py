@@ -5,191 +5,169 @@ import timm
 from PIL import Image
 from torchvision import transforms
 import os
+import pandas as pd
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
 
-# --- 2. YOUR EXACT CLASS LIST ---
-# This matches the training data perfectly.
+# --- 2. EXACT CLASS LIST ---
 vocab = ['AFib', 'Anterior MI', 'Inferior MI', 'LBBB', 'Left Vent. Hypertrophy', 'Normal', 'RBBB', 'Sinus Rhythm']
 
-# --- 3. FLEXIBLE MODEL ARCHITECTURE ---
+# --- 3. MODEL ARCHITECTURE ---
 class ECGModel(nn.Module):
-    def __init__(self, num_classes, use_final_bias=True):
+    def __init__(self, num_classes):
         super().__init__()
-        # Body (EfficientNet-B0)
-        # We load the base model without the classifier
+        # Body
         self.body = timm.create_model('efficientnet_b0', pretrained=False, num_classes=0)
         
-        # Head (FastAI Custom Structure)
-        # This matches the layers in your saved weights file exactly.
+        # Head (Reconstructed from FastAI)
         self.head = nn.Sequential(
-            nn.BatchNorm1d(2560),           # head.0
+            nn.BatchNorm1d(2560),
             nn.Dropout(0.25),
-            nn.Linear(2560, 512, bias=False), # head.2
+            nn.Linear(2560, 512, bias=False),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(512),            # head.4
+            nn.BatchNorm1d(512),
             nn.Dropout(0.5),
-            nn.Linear(512, num_classes, bias=use_final_bias) # head.6 (Output)
+            nn.Linear(512, num_classes, bias=False) # Bias determined dynamically below
         )
         
     def forward(self, x):
-        # 1. Get features from body
         x = self.body.forward_features(x)
-        
-        # 2. FastAI ConcatPooling (Global Avg + Global Max)
-        # [Batch, 1280, 7, 7] -> [Batch, 2560]
-        avg_pool = torch.mean(x, dim=(2,3))
-        max_pool = torch.amax(x, dim=(2,3))
-        x = torch.cat([avg_pool, max_pool], dim=1)
-        
-        # 3. Pass through head
+        # FastAI Pooling (Avg + Max)
+        x = torch.cat([x.mean(dim=(2,3)), x.amax(dim=(2,3))], dim=1)
         x = self.head(x)
         return x
 
-# --- 4. THE SMART LOADER ---
+# --- 4. STRICT LOADER ---
 @st.cache_resource
 def load_model():
     if not os.path.exists('ecg_weights.pth'):
-        st.error("❌ Error: 'ecg_weights.pth' not found. Please upload it to GitHub.")
+        st.error("❌ 'ecg_weights.pth' missing. Please upload to GitHub.")
         st.stop()
         
-    # A. Load raw weights
     state_dict = torch.load('ecg_weights.pth', map_location='cpu')
     
-    # B. Auto-Detect Bias
-    # FastAI models sometimes have a bias in the final layer, sometimes not.
-    # We check the file to see if '1.8.bias' (the output bias) exists.
-    has_bias = False
-    for k in state_dict.keys():
-        if k.endswith('8.bias'): 
-            has_bias = True
-            break
-            
-    # C. Build the correct skeleton
-    model = ECGModel(num_classes=len(vocab), use_final_bias=has_bias)
+    # 1. Detect Bias
+    has_bias = any(k.endswith('8.bias') for k in state_dict.keys())
     
-    # D. Key Mapping (FastAI -> PyTorch)
-    # We rename the keys in the file to match our manual model class
+    # 2. Build Model
+    model = ECGModel(num_classes=len(vocab))
+    if has_bias:
+        model.head[6] = nn.Linear(512, len(vocab), bias=True)
+
+    # 3. Clean & Remap Keys
     new_state_dict = {}
-    for key, value in state_dict.items():
-        # Body Mapping: "0.model.layer" -> "body.layer"
-        if key.startswith('0.model.'):
-            new_key = key.replace('0.model.', 'body.')
-            new_state_dict[new_key] = value
+    for k, v in state_dict.items():
+        # Remove 'num_batches_tracked' (FastAI noise)
+        if 'num_batches_tracked' in k: continue
         
-        # Head Mapping: "1.layer" -> "head.index"
-        elif key.startswith('1.'):
-            parts = key.split('.')
-            idx = parts[1] # e.g., '2', '4', '8'
-            param = parts[2] # weight or bias
+        # Remap Body
+        if k.startswith('0.model.'):
+            new_k = k.replace('0.model.', 'body.')
+            new_state_dict[new_k] = v
             
-            # Map FastAI indices to our Sequential indices
-            if idx == '2': new_idx = '0'   # BN
-            elif idx == '4': new_idx = '2' # Linear
-            elif idx == '6': new_idx = '4' # BN
-            elif idx == '8': new_idx = '6' # Linear (Output)
+        # Remap Head
+        elif k.startswith('1.'):
+            parts = k.split('.')
+            idx, param = parts[1], parts[2]
+            if idx == '2': new_idx = '0'
+            elif idx == '4': new_idx = '2'
+            elif idx == '6': new_idx = '4'
+            elif idx == '8': new_idx = '6'
             else: continue
-            
-            new_key = f"head.{new_idx}.{param}"
-            new_state_dict[new_key] = value
-            
-    # E. Load Weights (Strict=False ignores minor version mismatches like 'num_batches_tracked')
-    model.load_state_dict(new_state_dict, strict=False)
+            new_state_dict[f"head.{new_idx}.{param}"] = v
+
+    # 4. Strict Load (Critical Check)
+    try:
+        model.load_state_dict(new_state_dict, strict=True)
+    except RuntimeError as e:
+        # If strict loading fails, print the mismatch for debugging
+        st.error(f"❌ Weight Mismatch: {e}")
+        st.stop()
+        
     model.eval()
     return model
 
 try:
     model = load_model()
 except Exception as e:
-    st.error(f"❌ Critical Error Building Model: {e}")
+    st.error(f"❌ Model Init Error: {e}")
     st.stop()
 
 # --- 5. IMAGE PREPROCESSING ---
 def process_image(img):
     if img.mode != 'RGB': img = img.convert('RGB')
     
-    # Standard ImageNet normalization
+    # We use a padding resize to avoid squishing the ECG signals
     t = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((224, 224)), 
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    return t(img).unsqueeze(0) # Add batch dimension
+    return t(img).unsqueeze(0)
 
-# --- 6. UI & INFERENCE ---
-st.title("🫀 AI-Powered ECG Interpreter")
+# --- 6. UI ---
+st.title("🫀 ECG AI Doctor (Debug Mode)")
+st.caption("Now showing top 3 predictions to diagnose mapping issues.")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    uploaded_file = st.file_uploader("Upload ECG Image", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.file_uploader("Upload 12-Lead ECG", type=["png", "jpg", "jpeg"])
     if uploaded_file:
         image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded ECG", use_column_width=True)
+        st.image(image, caption="Uploaded Trace", use_container_width=True)
         
         if st.button("Analyze Tracing"):
-            with st.spinner("Analyzing rhythm patterns..."):
-                try:
-                    # Inference
-                    img_t = process_image(image)
-                    with torch.no_grad():
-                        out = model(img_t)
-                        probs = torch.softmax(out, dim=1)
-                        conf, idx = torch.max(probs, 1)
-                    
-                    # Get Result
-                    pred_label = vocab[idx.item()]
-                    conf_score = conf.item() * 100
-                    
-                    # Store in Session State
-                    st.session_state.prediction = pred_label
-                    st.session_state.confidence = conf_score
-                    st.session_state.run_llm = True
-                    
-                except Exception as e:
-                    st.error(f"Prediction Failed: {e}")
+            with st.spinner("Analyzing..."):
+                img_t = process_image(image)
+                with torch.no_grad():
+                    out = model(img_t)
+                    probs = torch.softmax(out, dim=1)
+                
+                # Get Top 3 Predictions
+                top3_prob, top3_idx = torch.topk(probs, 3)
+                
+                # Store in session
+                st.session_state.top3_results = []
+                for i in range(3):
+                    label = vocab[top3_idx[0][i].item()]
+                    score = top3_prob[0][i].item() * 100
+                    st.session_state.top3_results.append((label, score))
+                
+                st.session_state.run_llm = True
 
 with col2:
-    if 'prediction' in st.session_state:
-        pred = st.session_state.prediction
-        conf = st.session_state.confidence
+    if 'top3_results' in st.session_state:
+        results = st.session_state.top3_results
+        top_pred, top_score = results[0]
         
-        # Dynamic Color Logic
-        if pred == "Normal" or pred == "Sinus Rhythm":
-            color = "green"
-        else:
-            color = "red"
-            
-        st.markdown(f"### Diagnosis: <span style='color:{color}'>{pred}</span>", unsafe_allow_html=True)
-        st.progress(int(conf))
-        st.caption(f"Model Confidence: {conf:.1f}%")
+        # 1. Primary Diagnosis
+        color = "green" if top_pred in ["Normal", "Sinus Rhythm"] else "red"
+        st.markdown(f"### Diagnosis: <span style='color:{color}'>{top_pred}</span>", unsafe_allow_html=True)
+        st.progress(int(top_score))
         
-        # LLM Report Generation
+        # 2. Probability Table (Debug Info)
+        st.markdown("#### 🔍 Probability Breakdown")
+        df = pd.DataFrame(results, columns=["Condition", "Confidence (%)"])
+        st.table(df)
+
+        # 3. Warning on Input Type
+        if top_score < 50:
+            st.warning("⚠️ Low confidence. Ensure you are uploading a **12-lead grid**, not a rhythm strip.")
+
+        # 4. LLM
         if st.session_state.get('run_llm', False):
             api_key = st.secrets.get("OPENAI_API_KEY", None)
-            
             if api_key:
                 try:
                     from openai import OpenAI
                     client = OpenAI(api_key=api_key)
-                    
-                    prompt = f"""
-                    You are a cardiologist. 
-                    Diagnosis: {pred} (Confidence: {conf:.1f}%).
-                    Explain what this condition is, its clinical significance, and immediate next steps.
-                    Keep it concise (3-4 sentences).
-                    """
-                    
-                    with st.spinner("Generating clinical notes..."):
-                        response = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[{"role": "user", "content": prompt}]
-                        )
-                        st.info(f"📋 **Physician's Note:**\n\n{response.choices[0].message.content}")
-                except Exception as e:
-                    st.warning(f"Could not generate report: {e}")
-            else:
-                st.info("ℹ️ Add `OPENAI_API_KEY` to Streamlit Secrets for full clinical reports.")
-            
+                    prompt = f"Explain the ECG finding: {top_pred} (Confidence: {top_score:.1f}%)."
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    st.info(resp.choices[0].message.content)
+                except: pass
             st.session_state.run_llm = False
