@@ -3,44 +3,66 @@ import pathlib
 import platform
 import os
 
-# # --- 1. CRITICAL WINDOWS FIX ---
-# # This must be the very first thing that runs.
-# # It tricks the computer into thinking Linux paths are Windows paths.
-# plt = platform.system()
-# if plt == 'Windows':
-#     pathlib.PosixPath = pathlib.WindowsPath
-
-# --- 2. IMPORTS ---
-# Now we can safely import fastai
-from fastai.vision.all import *
-from PIL import Image
-import json
-
-# --- 3. CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
 
-# --- 4. MODEL LOADING ---
+# --- 2. UNIVERSAL MODEL LOADER ---
 @st.cache_resource
 def load_ecg_model():
+    """
+    Robust loader that works on both Windows and Linux,
+    regardless of where the model was trained.
+    """
+    from fastai.vision.all import load_learner
+    
     model_path = 'ecg_model_v1.pkl'
     
     if not os.path.exists(model_path):
         st.error(f"❌ Critical Error: Model file '{model_path}' not found!")
         st.stop()
 
+    # STRATEGY 1: Try Standard Load (Best Case)
     try:
-        # Standard load
         learn = load_learner(model_path)
         return learn
-    except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
+    except Exception as e_standard:
+        # If standard load fails, we try patching based on OS
+        
+        # STRATEGY 2: Windows Patch (Loading Linux model on Windows)
+        if platform.system() == 'Windows':
+            try:
+                # Force PosixPath to be WindowsPath
+                pathlib.PosixPath = pathlib.WindowsPath
+                learn = load_learner(model_path)
+                return learn
+            except Exception as e_win:
+                st.error(f"❌ Windows Patch Failed: {e_win}")
+        
+        # STRATEGY 3: Linux Patch (Loading Windows model on Cloud/Linux)
+        else: # Linux/Mac
+            try:
+                # Force WindowsPath to be PosixPath
+                pathlib.WindowsPath = pathlib.PosixPath
+                learn = load_learner(model_path)
+                return learn
+            except Exception as e_linux:
+                st.error(f"❌ Linux Patch Failed: {e_linux}")
+        
+        # If we reach here, nothing worked
+        st.error("❌ All loading attempts failed.")
+        st.error(f"Original Error: {e_standard}")
         st.stop()
 
-# Load the model
+# Load the model immediately
 learn = load_ecg_model()
 
-# --- 5. UI LAYOUT ---
-st.title("🫀 AI-Powered ECG Interpreter (Local)")
+# --- 3. UI LAYOUT ---
+# Only import FastAI libraries AFTER patching
+from fastai.vision.all import *
+from PIL import Image
+import json
+
+st.title("🫀 AI-Powered ECG Interpreter")
 st.markdown("Upload a 12-lead ECG image (or rhythm strip) for instant analysis.")
 
 col1, col2 = st.columns([1, 1])
@@ -84,11 +106,11 @@ with col2:
 
         # LLM SECTION
         if st.session_state.get('run_llm', False):
-            # Attempt to get key from secrets or environment
+            # Check for API Key in Secrets OR Environment Variable
             api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
             
             if not api_key:
-                st.warning("⚠️ No API Key found. Using Mock Report (Simulation Mode).")
+                st.warning("⚠️ No API Key found. Using Mock Report.")
                 report = {
                     "rhythm_diagnosis": pred,
                     "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
