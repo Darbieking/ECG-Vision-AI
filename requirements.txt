@@ -5,3 +5,4 @@ torchvision
 openai
 pillow
 ipython
+timm
