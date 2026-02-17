@@ -1,32 +1,38 @@
 import streamlit as st
+import pathlib
+import platform
+import os
+
+# --- 1. THE CRITICAL FIX ---
+# We must apply this patch BEFORE importing fastai.
+# This forces Linux to accept 'WindowsPath' objects from your model file.
+posix_backup = pathlib.PosixPath
+try:
+    pathlib.WindowsPath = pathlib.PosixPath
+except:
+    pass
+
+# --- 2. IMPORTS ---
+# Now it is safe to import fastai
 from fastai.vision.all import *
 from PIL import Image
 import json
-import pathlib
-import os
 
-# --- 1. LINUX PATCH FOR WINDOWS MODELS ---
-# This block is CRITICAL. It tells Linux (Streamlit Cloud) how to handle
-# paths that were saved on a Windows machine.
-import pathlib
-temp = pathlib.PosixPath
-pathlib.PosixPath = pathlib.WindowsPath # Fix for some pickle weirdness
-pathlib.WindowsPath = pathlib.PosixPath # The actual fix for your error
-
-# --- 2. CONFIGURATION ---
+# --- 3. CONFIGURATION ---
 st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
 
-# --- 3. MODEL LOADING ---
+# --- 4. MODEL LOADING ---
 @st.cache_resource
 def load_ecg_model():
-    # Verify file exists
-    if not os.path.exists('ecg_model_v1.pkl'):
-        st.error("❌ Critical Error: 'ecg_model_v1.pkl' is missing from the repository.")
+    model_path = 'ecg_model_v1.pkl'
+    
+    if not os.path.exists(model_path):
+        st.error(f"❌ Critical Error: Model file '{model_path}' not found!")
         st.stop()
-        
+
     try:
         # Load the model
-        learn = load_learner('ecg_model_v1.pkl')
+        learn = load_learner(model_path)
         return learn
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
@@ -35,7 +41,7 @@ def load_ecg_model():
 # Load immediately
 learn = load_ecg_model()
 
-# --- 4. UI LAYOUT ---
+# --- 5. UI LAYOUT ---
 st.title("🫀 AI-Powered ECG Interpreter")
 st.markdown("Upload a 12-lead ECG image (or rhythm strip) for instant analysis.")
 
@@ -79,21 +85,21 @@ with col2:
 
         # LLM SECTION
         if st.session_state.get('run_llm', False):
-            # Safe API Key Retrieval
-            try:
-                from openai import OpenAI
-                api_key = st.secrets.get("OPENAI_API_KEY", None)
-                
-                if not api_key:
-                    st.warning("⚠️ No OpenAI API Key found in Secrets. Using Mock Report.")
-                    report = {
-                        "rhythm_diagnosis": pred,
-                        "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
-                        "key_findings": ["Visual pattern matches diagnosis", "QRS morphology consistent"],
-                        "immediate_action": "Verify with cardiologist.",
-                        "urgency": "High"
-                    }
-                else:
+            # Check for API Key in Secrets OR Environment Variable
+            api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+            
+            if not api_key:
+                st.warning("⚠️ No OpenAI API Key found. Using Mock Report.")
+                report = {
+                    "rhythm_diagnosis": pred,
+                    "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
+                    "key_findings": ["Visual pattern matches diagnosis", "QRS morphology consistent"],
+                    "immediate_action": "Verify with cardiologist.",
+                    "urgency": "High"
+                }
+            else:
+                try:
+                    from openai import OpenAI
                     client = OpenAI(api_key=api_key)
                     prompt = f"""
                     You are a cardiologist. Analyze this diagnosis: {pred} (Confidence: {conf:.1f}%).
@@ -105,9 +111,9 @@ with col2:
                         response_format={"type": "json_object"}
                     )
                     report = json.loads(response.choices[0].message.content)
-            except Exception as e:
-                st.error(f"LLM Error: {e}")
-                report = None
+                except Exception as e:
+                    st.error(f"LLM Error: {e}")
+                    report = None
 
             if report:
                 st.subheader("📋 Physician's Note")
