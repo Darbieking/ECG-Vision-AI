@@ -1,67 +1,41 @@
 import streamlit as st
-import pathlib
-import platform
-import os
-
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
-
-# --- 2. UNIVERSAL MODEL LOADER ---
-@st.cache_resource
-def load_ecg_model():
-    """
-    Robust loader that works on both Windows and Linux,
-    regardless of where the model was trained.
-    """
-    from fastai.vision.all import load_learner
-    
-    model_path = 'ecg_model_v1.pkl'
-    
-    if not os.path.exists(model_path):
-        st.error(f"❌ Critical Error: Model file '{model_path}' not found!")
-        st.stop()
-
-    # STRATEGY 1: Try Standard Load (Best Case)
-    try:
-        learn = load_learner(model_path)
-        return learn
-    except Exception as e_standard:
-        # If standard load fails, we try patching based on OS
-        
-        # STRATEGY 2: Windows Patch (Loading Linux model on Windows)
-        if platform.system() == 'Windows':
-            try:
-                # Force PosixPath to be WindowsPath
-                pathlib.PosixPath = pathlib.WindowsPath
-                learn = load_learner(model_path)
-                return learn
-            except Exception as e_win:
-                st.error(f"❌ Windows Patch Failed: {e_win}")
-        
-        # STRATEGY 3: Linux Patch (Loading Windows model on Cloud/Linux)
-        else: # Linux/Mac
-            try:
-                # Force WindowsPath to be PosixPath
-                pathlib.WindowsPath = pathlib.PosixPath
-                learn = load_learner(model_path)
-                return learn
-            except Exception as e_linux:
-                st.error(f"❌ Linux Patch Failed: {e_linux}")
-        
-        # If we reach here, nothing worked
-        st.error("❌ All loading attempts failed.")
-        st.error(f"Original Error: {e_standard}")
-        st.stop()
-
-# Load the model immediately
-learn = load_ecg_model()
-
-# --- 3. UI LAYOUT ---
-# Only import FastAI libraries AFTER patching
 from fastai.vision.all import *
 from PIL import Image
 import json
+import pathlib
+import os
 
+# --- 1. LINUX PATCH FOR WINDOWS MODELS ---
+# This block is CRITICAL. It tells Linux (Streamlit Cloud) how to handle
+# paths that were saved on a Windows machine.
+import pathlib
+temp = pathlib.PosixPath
+pathlib.PosixPath = pathlib.WindowsPath # Fix for some pickle weirdness
+pathlib.WindowsPath = pathlib.PosixPath # The actual fix for your error
+
+# --- 2. CONFIGURATION ---
+st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
+
+# --- 3. MODEL LOADING ---
+@st.cache_resource
+def load_ecg_model():
+    # Verify file exists
+    if not os.path.exists('ecg_model_v1.pkl'):
+        st.error("❌ Critical Error: 'ecg_model_v1.pkl' is missing from the repository.")
+        st.stop()
+        
+    try:
+        # Load the model
+        learn = load_learner('ecg_model_v1.pkl')
+        return learn
+    except Exception as e:
+        st.error(f"❌ Error loading model: {e}")
+        st.stop()
+
+# Load immediately
+learn = load_ecg_model()
+
+# --- 4. UI LAYOUT ---
 st.title("🫀 AI-Powered ECG Interpreter")
 st.markdown("Upload a 12-lead ECG image (or rhythm strip) for instant analysis.")
 
@@ -94,7 +68,6 @@ with col2:
         pred = st.session_state.prediction
         conf = st.session_state.confidence
         
-        # Color coding
         color = "red" if pred in ["Inferior MI", "Anterior MI", "AFib"] else "green"
         
         st.markdown(f"### Diagnosis: <span style='color:{color}'>{pred.upper()}</span>", unsafe_allow_html=True)
@@ -106,21 +79,21 @@ with col2:
 
         # LLM SECTION
         if st.session_state.get('run_llm', False):
-            # Check for API Key in Secrets OR Environment Variable
-            api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-            
-            if not api_key:
-                st.warning("⚠️ No API Key found. Using Mock Report.")
-                report = {
-                    "rhythm_diagnosis": pred,
-                    "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
-                    "key_findings": ["Visual pattern matches diagnosis", "QRS morphology consistent"],
-                    "immediate_action": "Verify with cardiologist.",
-                    "urgency": "High"
-                }
-            else:
-                try:
-                    from openai import OpenAI
+            # Safe API Key Retrieval
+            try:
+                from openai import OpenAI
+                api_key = st.secrets.get("OPENAI_API_KEY", None)
+                
+                if not api_key:
+                    st.warning("⚠️ No OpenAI API Key found in Secrets. Using Mock Report.")
+                    report = {
+                        "rhythm_diagnosis": pred,
+                        "clinical_significance": "This is a SIMULATED report. Add OpenAI Key for real analysis.",
+                        "key_findings": ["Visual pattern matches diagnosis", "QRS morphology consistent"],
+                        "immediate_action": "Verify with cardiologist.",
+                        "urgency": "High"
+                    }
+                else:
                     client = OpenAI(api_key=api_key)
                     prompt = f"""
                     You are a cardiologist. Analyze this diagnosis: {pred} (Confidence: {conf:.1f}%).
@@ -132,9 +105,9 @@ with col2:
                         response_format={"type": "json_object"}
                     )
                     report = json.loads(response.choices[0].message.content)
-                except Exception as e:
-                    st.error(f"LLM Error: {e}")
-                    report = None
+            except Exception as e:
+                st.error(f"LLM Error: {e}")
+                report = None
 
             if report:
                 st.subheader("📋 Physician's Note")
