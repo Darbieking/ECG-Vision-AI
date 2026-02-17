@@ -2,34 +2,42 @@ import streamlit as st
 from fastai.vision.all import *
 from PIL import Image
 import json
-from openai import OpenAI
+import pathlib
+import os
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="ECG AI Diagnosis", page_icon="🫀", layout="wide")
 
-# --- 2. MODEL LOADING ---
+# --- 2. MODEL LOADING (Robust) ---
 @st.cache_resource
 def load_ecg_model():
     """Loads the FastAI model. Cached for speed."""
-    # Fix for PosixPath issues if moving between Windows/Linux
-    import pathlib
-    temp = pathlib.PosixPath
-    pathlib.PosixPath = pathlib.WindowsPath
+    
+    # Check if file exists first
+    if not os.path.exists('ecg_model_v1.pkl'):
+        st.error("❌ CRITICAL ERROR: Model file 'ecg_model_v1.pkl' not found!")
+        st.warning("Please verify that 'ecg_model_v1.pkl' is uploaded to your GitHub repository.")
+        st.stop() # Stop the app here if file is missing
     
     try:
+        # Try loading normally
         learn = load_learner('ecg_model_v1.pkl')
-    except:
-        # If running on Linux (Streamlit Cloud), revert to Posix
-        pathlib.PosixPath = temp
-        learn = load_learner('ecg_model_v1.pkl')
-        
-    return learn
+        return learn
+    except Exception as e:
+        # Fallback: If there's a path issue (Windows -> Linux), try patching
+        try:
+            temp = pathlib.PosixPath
+            pathlib.PosixPath = pathlib.WindowsPath
+            learn = load_learner('ecg_model_v1.pkl')
+            return learn
+        except Exception as e2:
+            st.error(f"❌ Error Loading Model: {e}")
+            st.error(f"Fallback attempt also failed: {e2}")
+            st.stop() # Stop the app if model is broken
 
-try:
-    learn = load_ecg_model()
-    model_status = "✅ Model Loaded"
-except Exception as e:
-    model_status = f"❌ Error: {e}"
+# Load the model immediately. 
+# If this fails, the app stops here, preventing the "NameError".
+learn = load_ecg_model()
 
 # --- 3. UI LAYOUT ---
 st.title("🫀 AI-Powered ECG Interpreter")
@@ -48,14 +56,17 @@ with col1:
         # PREDICTION BUTTON
         if st.button("Analyze Tracing"):
             with st.spinner("Analyzing rhythm patterns..."):
-                # FastAI Inference
-                pred_class, pred_idx, probs = learn.predict(image)
-                confidence = float(probs[pred_idx]) * 100
-                
-                # Store results in session state to persist
-                st.session_state.prediction = pred_class
-                st.session_state.confidence = confidence
-                st.session_state.run_llm = True
+                try:
+                    # FastAI Inference
+                    pred_class, pred_idx, probs = learn.predict(image)
+                    confidence = float(probs[pred_idx]) * 100
+                    
+                    # Store results in session state to persist
+                    st.session_state.prediction = pred_class
+                    st.session_state.confidence = confidence
+                    st.session_state.run_llm = True
+                except Exception as e:
+                    st.error(f"Prediction Error: {e}")
 
 with col2:
     st.header("Clinical Report")
@@ -65,7 +76,7 @@ with col2:
         pred = st.session_state.prediction
         conf = st.session_state.confidence
         
-        # Color code based on severity (Simple logic for demo)
+        # Color code based on severity
         color = "red" if pred in ["Inferior MI", "Anterior MI", "AFib"] else "green"
         
         st.markdown(f"### Diagnosis: <span style='color:{color}'>{pred.upper()}</span>", unsafe_allow_html=True)
@@ -79,21 +90,22 @@ with col2:
         if st.session_state.get('run_llm', False):
             
             # CHECK FOR API KEY (Secrets or Sidebar)
-            api_key = st.secrets.get("OPENAI_API_KEY", None)
-            
-            if not api_key:
-                st.warning("⚠️ No OpenAI API Key found in Secrets. Using Mock Report.")
-                # Mock Response for Demo
-                report = {
-                    "rhythm_diagnosis": pred,
-                    "clinical_significance": "Requires API Key for full analysis.",
-                    "key_findings": ["Pattern matched visual features"],
-                    "immediate_action": "Configure Secrets on Streamlit Cloud.",
-                    "urgency": "High"
-                }
-            else:
-                # REAL LLM CALL
-                try:
+            # We import OpenAI inside the block to avoid errors if the library isn't used
+            try:
+                from openai import OpenAI
+                api_key = st.secrets.get("OPENAI_API_KEY", None)
+                
+                if not api_key:
+                    st.warning("⚠️ No OpenAI API Key found in Secrets. Using Mock Report.")
+                    # Mock Response for Demo
+                    report = {
+                        "rhythm_diagnosis": pred,
+                        "clinical_significance": "Requires API Key for full analysis.",
+                        "key_findings": ["Pattern matched visual features"],
+                        "immediate_action": "Configure Secrets on Streamlit Cloud.",
+                        "urgency": "High"
+                    }
+                else:
                     client = OpenAI(api_key=api_key)
                     prompt = f"""
                     You are a cardiologist. Analyze this diagnosis: {pred} (Confidence: {conf:.1f}%).
@@ -106,9 +118,9 @@ with col2:
                         response_format={"type": "json_object"}
                     )
                     report = json.loads(response.choices[0].message.content)
-                except Exception as e:
-                    st.error(f"LLM Error: {e}")
-                    report = None
+            except Exception as e:
+                st.error(f"LLM Error: {e}")
+                report = None
 
             # 3. RENDER REPORT
             if report:
@@ -122,4 +134,4 @@ with col2:
                 st.error(f"**Action:** {report.get('immediate_action')}")
                 st.caption(f"Urgency Level: {report.get('urgency')}")
                 
-            st.session_state.run_llm = False # Don't re-run on every refresh
+            st.session_state.run_llm = False
